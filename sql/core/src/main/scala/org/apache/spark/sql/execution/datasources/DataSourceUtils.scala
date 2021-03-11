@@ -26,10 +26,11 @@ import org.json4s.NoTypeHints
 import org.json4s.jackson.Serialization
 
 import org.apache.spark.SparkUpgradeException
-import org.apache.spark.sql.{SPARK_INT96_NO_REBASE, SPARK_LEGACY_DATETIME, SPARK_VERSION_METADATA_KEY}
+import org.apache.spark.sql.{SPARK_LEGACY_DATETIME, SPARK_LEGACY_INT96, SPARK_VERSION_METADATA_KEY}
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.catalog.{CatalogTable, CatalogUtils}
 import org.apache.spark.sql.catalyst.util.RebaseDateTime
+import org.apache.spark.sql.execution.datasources.parquet.ParquetOptions
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.SQLConf.LegacyBehaviorPolicy
 import org.apache.spark.sql.sources.BaseRelation
@@ -115,37 +116,47 @@ object DataSourceUtils {
       lookupFileMeta: String => String,
       modeByConfig: String): LegacyBehaviorPolicy.Value = {
     if (Utils.isTesting && SQLConf.get.getConfString("spark.test.forceNoRebase", "") == "true") {
-      LegacyBehaviorPolicy.CORRECTED
-    } else if (lookupFileMeta(SPARK_INT96_NO_REBASE) != null) {
-      LegacyBehaviorPolicy.CORRECTED
-    } else if (lookupFileMeta(SPARK_VERSION_METADATA_KEY) != null) {
-      LegacyBehaviorPolicy.LEGACY
-    } else {
-      LegacyBehaviorPolicy.withName(modeByConfig)
+      return LegacyBehaviorPolicy.CORRECTED
     }
+    // If there is no version, we return the mode specified by the config.
+    Option(lookupFileMeta(SPARK_VERSION_METADATA_KEY)).map { version =>
+      // Files written by Spark 3.0 and earlier follow the legacy hybrid calendar and we need to
+      // rebase the INT96 timestamp values.
+      // Files written by Spark 3.1 and latter may also need the rebase if they were written with
+      // the "LEGACY" rebase mode.
+      if (version < "3.1.0" || lookupFileMeta(SPARK_LEGACY_INT96) != null) {
+        LegacyBehaviorPolicy.LEGACY
+      } else {
+        LegacyBehaviorPolicy.CORRECTED
+      }
+    }.getOrElse(LegacyBehaviorPolicy.withName(modeByConfig))
   }
 
   def newRebaseExceptionInRead(format: String): SparkUpgradeException = {
-    val config = format match {
-      case "Parquet INT96" => SQLConf.LEGACY_PARQUET_INT96_REBASE_MODE_IN_READ.key
-      case "Parquet" => SQLConf.LEGACY_PARQUET_REBASE_MODE_IN_READ.key
-      case "Avro" => SQLConf.LEGACY_AVRO_REBASE_MODE_IN_READ.key
+    val (config, option) = format match {
+      case "Parquet INT96" =>
+        (SQLConf.PARQUET_INT96_REBASE_MODE_IN_READ.key, ParquetOptions.INT96_REBASE_MODE)
+      case "Parquet" =>
+        (SQLConf.PARQUET_REBASE_MODE_IN_READ.key, ParquetOptions.DATETIME_REBASE_MODE)
+      case "Avro" =>
+        (SQLConf.AVRO_REBASE_MODE_IN_READ.key, "datetimeRebaseMode")
       case _ => throw new IllegalStateException("unrecognized format " + format)
     }
     new SparkUpgradeException("3.0", "reading dates before 1582-10-15 or timestamps before " +
       s"1900-01-01T00:00:00Z from $format files can be ambiguous, as the files may be written by " +
       "Spark 2.x or legacy versions of Hive, which uses a legacy hybrid calendar that is " +
       "different from Spark 3.0+'s Proleptic Gregorian calendar. See more details in " +
-      s"SPARK-31404. You can set $config to 'LEGACY' to rebase the datetime values w.r.t. " +
-      s"the calendar difference during reading. Or set $config to 'CORRECTED' to read the " +
-      "datetime values as it is.", null)
+      s"SPARK-31404. You can set the SQL config '$config' or the datasource option '$option' to " +
+      "'LEGACY' to rebase the datetime values w.r.t. the calendar difference during reading. " +
+      s"To read the datetime values as it is, set the SQL config '$config' or " +
+      s"the datasource option '$option' to 'CORRECTED'.", null)
   }
 
   def newRebaseExceptionInWrite(format: String): SparkUpgradeException = {
     val config = format match {
-      case "Parquet INT96" => SQLConf.LEGACY_PARQUET_INT96_REBASE_MODE_IN_WRITE.key
-      case "Parquet" => SQLConf.LEGACY_PARQUET_REBASE_MODE_IN_WRITE.key
-      case "Avro" => SQLConf.LEGACY_AVRO_REBASE_MODE_IN_WRITE.key
+      case "Parquet INT96" => SQLConf.PARQUET_INT96_REBASE_MODE_IN_WRITE.key
+      case "Parquet" => SQLConf.PARQUET_REBASE_MODE_IN_WRITE.key
+      case "Avro" => SQLConf.AVRO_REBASE_MODE_IN_WRITE.key
       case _ => throw new IllegalStateException("unrecognized format " + format)
     }
     new SparkUpgradeException("3.0", "writing dates before 1582-10-15 or timestamps before " +

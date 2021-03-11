@@ -40,7 +40,6 @@ import org.apache.spark.sql.connector.catalog.{SupportsWrite, Table}
 import org.apache.spark.sql.connector.read.streaming.{Offset => OffsetV2, ReadLimit, SparkDataStream}
 import org.apache.spark.sql.connector.write.{LogicalWriteInfoImpl, SupportsTruncate}
 import org.apache.spark.sql.connector.write.streaming.StreamingWrite
-import org.apache.spark.sql.execution.QueryExecution
 import org.apache.spark.sql.execution.command.StreamingExplainCommand
 import org.apache.spark.sql.execution.datasources.v2.StreamWriterCommitProgress
 import org.apache.spark.sql.internal.SQLConf
@@ -161,6 +160,15 @@ abstract class StreamExecution(
    */
   @volatile
   var availableOffsets = new StreamProgress
+
+  /**
+   * Tracks the latest offsets for each input source.
+   * Only the scheduler thread should modify this field, and only in atomic steps.
+   * Other threads should make a shallow copy if they are going to access this field more than
+   * once, since the field's value may change at any time.
+   */
+  @volatile
+  var latestOffsets = new StreamProgress
 
   @volatile
   var sinkCommitProgress: Option[StreamWriterCommitProgress] = None
@@ -315,26 +323,28 @@ abstract class StreamExecution(
       startLatch.countDown()
 
       // While active, repeatedly attempt to run batches.
-      SparkSession.setActiveSessionInternal(sparkSession)
+      sparkSessionForStream.withActive {
+        // Adaptive execution can change num shuffle partitions, disallow
+        sparkSessionForStream.conf.set(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, "false")
+        // Disable cost-based join optimization as we do not want stateful operations
+        // to be rearranged
+        sparkSessionForStream.conf.set(SQLConf.CBO_ENABLED.key, "false")
 
-      updateStatusMessage("Initializing sources")
-      // force initialization of the logical plan so that the sources can be created
-      logicalPlan
+        updateStatusMessage("Initializing sources")
+        // force initialization of the logical plan so that the sources can be created
+        logicalPlan
 
-      // Adaptive execution can change num shuffle partitions, disallow
-      sparkSessionForStream.conf.set(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, "false")
-      // Disable cost-based join optimization as we do not want stateful operations to be rearranged
-      sparkSessionForStream.conf.set(SQLConf.CBO_ENABLED.key, "false")
-      offsetSeqMetadata = OffsetSeqMetadata(
-        batchWatermarkMs = 0, batchTimestampMs = 0, sparkSessionForStream.conf)
+        offsetSeqMetadata = OffsetSeqMetadata(
+          batchWatermarkMs = 0, batchTimestampMs = 0, sparkSessionForStream.conf)
 
-      if (state.compareAndSet(INITIALIZING, ACTIVE)) {
-        // Unblock `awaitInitialization`
-        initializationLatch.countDown()
-        runActivatedStream(sparkSessionForStream)
-        updateStatusMessage("Stopped")
-      } else {
-        // `stop()` is already called. Let `finally` finish the cleanup.
+        if (state.compareAndSet(INITIALIZING, ACTIVE)) {
+          // Unblock `awaitInitialization`
+          initializationLatch.countDown()
+          runActivatedStream(sparkSessionForStream)
+          updateStatusMessage("Stopped")
+        } else {
+          // `stop()` is already called. Let `finally` finish the cleanup.
+        }
       }
     } catch {
       case e if isInterruptedByStop(e, sparkSession.sparkContext) =>
@@ -619,21 +629,22 @@ abstract class StreamExecution(
       inputPlan.schema,
       new CaseInsensitiveStringMap(options.asJava))
     val writeBuilder = table.newWriteBuilder(info)
-    outputMode match {
+    val write = outputMode match {
       case Append =>
-        writeBuilder.buildForStreaming()
+        writeBuilder.build()
 
       case Complete =>
         // TODO: we should do this check earlier when we have capability API.
         require(writeBuilder.isInstanceOf[SupportsTruncate],
           table.name + " does not support Complete mode.")
-        writeBuilder.asInstanceOf[SupportsTruncate].truncate().buildForStreaming()
+        writeBuilder.asInstanceOf[SupportsTruncate].truncate().build()
 
       case Update =>
         require(writeBuilder.isInstanceOf[SupportsStreamingUpdateAsAppend],
           table.name + " does not support Update mode.")
-        writeBuilder.asInstanceOf[SupportsStreamingUpdateAsAppend].buildForStreaming()
+        writeBuilder.asInstanceOf[SupportsStreamingUpdateAsAppend].build()
     }
+    write.toStreaming
   }
 
   protected def purge(threshold: Long): Unit = {
@@ -686,6 +697,6 @@ object StreamExecution {
 
 /**
  * A special thread to run the stream query. Some codes require to run in the QueryExecutionThread
- * and will use `classOf[QueryxecutionThread]` to check.
+ * and will use `classOf[QueryExecutionThread]` to check.
  */
 abstract class QueryExecutionThread(name: String) extends UninterruptibleThread(name)
